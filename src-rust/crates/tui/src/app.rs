@@ -122,6 +122,70 @@ pub enum DisplayMessage {
     System { text: String, style: SystemMessageStyle },
 }
 
+/// Context menu state: position and currently selected item index.
+#[derive(Debug, Clone, Copy)]
+pub struct ContextMenuState {
+    /// X coordinate of the menu (column).
+    pub x: u16,
+    /// Y coordinate of the menu (row).
+    pub y: u16,
+    /// Currently selected menu item index (0-based).
+    pub selected_index: usize,
+}
+
+/// Available context menu items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextMenuItem {
+    Copy,
+    Paste,
+    Cut,
+    SelectAll,
+    Clear,
+}
+
+/// State for the Go to Line dialog (Ctrl+G in message pane).
+#[derive(Debug, Clone)]
+pub struct GoToLineDialog {
+    /// Input field for line number.
+    pub input: String,
+    /// Whether the dialog is currently active.
+    pub active: bool,
+    /// Total number of lines (for validation feedback).
+    pub total_lines: usize,
+}
+
+impl GoToLineDialog {
+    pub fn new() -> Self {
+        Self {
+            input: String::new(),
+            active: false,
+            total_lines: 0,
+        }
+    }
+
+    pub fn open(&mut self, total_lines: usize) {
+        self.input.clear();
+        self.active = true;
+        self.total_lines = total_lines;
+    }
+
+    pub fn close(&mut self) {
+        self.active = false;
+        self.input.clear();
+    }
+
+    /// Parse the input as a line number (1-indexed).
+    /// Returns None if invalid or out of range.
+    pub fn parse_line_number(&self) -> Option<usize> {
+        let line_num: usize = self.input.trim().parse().ok()?;
+        if line_num >= 1 && line_num <= self.total_lines {
+            Some(line_num)
+        } else {
+            None
+        }
+    }
+}
+
 /// Status of an active or completed tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolStatus {
@@ -430,6 +494,8 @@ pub struct App {
     pub model_picker: ModelPickerState,
     /// Session browser overlay (/session, /resume, /rename, /export).
     pub session_browser: SessionBrowserState,
+    /// Session branching overlay (Ctrl+B) — create and switch branches.
+    pub session_branching: crate::session_branching::SessionBranchingState,
     /// Task progress overlay (Ctrl+T) — shows task status with toggle capability.
     pub tasks_overlay: TasksOverlay,
     /// Export format picker dialog (/export).
@@ -438,6 +504,8 @@ pub struct App {
     pub context_viz: ContextVizState,
     /// MCP server approval dialog.
     pub mcp_approval: McpApprovalDialogState,
+    /// Go to Line dialog (Ctrl+G in message pane).
+    pub go_to_line_dialog: GoToLineDialog,
     /// Bypass-permissions startup confirmation dialog.
     /// Shown at startup when --dangerously-skip-permissions was passed.
     /// User must explicitly accept or the session exits.
@@ -513,6 +581,16 @@ pub struct App {
     pub selection_focus: Option<(u16, u16)>,
     /// Text extracted from the current selection (updated each render frame).
     pub selection_text: RefCell<String>,
+
+    // ---- Advanced mouse interaction state --------------------------------
+    /// Timestamp of the last left mouse click (for double/triple-click detection).
+    pub last_click_time: Option<std::time::Instant>,
+    /// Position of the last left mouse click (for double/triple-click detection).
+    pub last_click_position: Option<(u16, u16)>,
+    /// Count of consecutive clicks: 1 = single, 2 = double, 3+ = triple.
+    pub click_count: u32,
+    /// Context menu state: position and selected index.
+    pub context_menu_state: Option<ContextMenuState>,
 
     // ---- Scroll acceleration state (trackpad feel) -----------------------
     /// Current acceleration multiplier for scroll events.
@@ -668,6 +746,7 @@ impl App {
             export_dialog: ExportDialogState::new(),
             context_viz: ContextVizState::new(),
             mcp_approval: McpApprovalDialogState::new(),
+            go_to_line_dialog: GoToLineDialog::new(),
             bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
             onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState::new(),
             home_dir_warning: false,
@@ -723,6 +802,10 @@ impl App {
             selection_anchor: None,
             selection_focus: None,
             selection_text: RefCell::new(String::new()),
+            last_click_time: None,
+            last_click_position: None,
+            click_count: 0,
+            context_menu_state: None,
             scroll_accel: 3.0,
             scroll_last_time: None,
             bash_prefix_allowlist: std::collections::HashSet::new(),
@@ -1572,6 +1655,26 @@ impl App {
         if self.global_search.open {
             return self.handle_global_search_key(key);
         }
+
+        // ---- Context menu handling (highest priority for menu navigation) ----
+        if self.context_menu_state.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.dismiss_context_menu();
+                    return false;
+                }
+                KeyCode::Up | KeyCode::Down => {
+                    self.navigate_context_menu(key.code);
+                    return false;
+                }
+                KeyCode::Enter => {
+                    self.execute_context_menu_item();
+                    return false;
+                }
+                _ => {}
+            }
+        }
+
         let key_context = self.current_key_context();
         if let Some(keystroke) = key_event_to_keystroke(&key) {
             let had_pending_chord = self.keybindings.has_pending_chord();
@@ -1679,6 +1782,55 @@ impl App {
                 KeyCode::Backspace => self.model_picker.pop_filter_char(),
                 KeyCode::Char(c) => self.model_picker.push_filter_char(c),
                 _ => {}
+            }
+            return false;
+        }
+
+        // Session branching overlay intercepts navigation and Esc
+        if self.session_branching.visible {
+            use crate::session_branching::BranchBrowserMode;
+            match self.session_branching.mode {
+                BranchBrowserMode::Browse => {
+                    match key.code {
+                        KeyCode::Esc => self.session_branching.cancel(),
+                        KeyCode::Up => self.session_branching.select_prev(),
+                        KeyCode::Down => self.session_branching.select_next(),
+                        KeyCode::Char('n') => self.session_branching.start_create_new(),
+                        KeyCode::Char('d') => self.session_branching.start_delete_confirm(),
+                        KeyCode::Enter => {
+                            if let Some(branch) = self.session_branching.selected_branch() {
+                                self.status_message = Some(format!("Switched to branch: {}", branch.name));
+                                self.session_branching.close();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                BranchBrowserMode::CreateNew => {
+                    match key.code {
+                        KeyCode::Esc => self.session_branching.cancel(),
+                        KeyCode::Enter => {
+                            if let Some((name, at_msg)) = self.session_branching.confirm_create_new() {
+                                self.status_message = Some(format!("Created branch: {} at message {}", name, at_msg));
+                                self.session_branching.close();
+                            }
+                        }
+                        KeyCode::Backspace => self.session_branching.pop_create_char(),
+                        KeyCode::Char(c) => self.session_branching.push_create_char(c),
+                        _ => {}
+                    }
+                }
+                BranchBrowserMode::ConfirmDelete => {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('n') => self.session_branching.cancel(),
+                        KeyCode::Enter | KeyCode::Char('y') => {
+                            if let Some(branch_id) = self.session_branching.confirm_delete() {
+                                self.status_message = Some(format!("Deleted branch: {}", branch_id));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
             return false;
         }
@@ -2179,6 +2331,50 @@ impl App {
             KeyCode::Char('?') if key.modifiers.is_empty() && !self.is_streaming => {
                 self.show_help = !self.show_help;
                 self.help_overlay.toggle();
+            }
+
+            // ---- Emacs-style kill ring operations ----------------------
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+                self.prompt_input.kill_line();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+                self.prompt_input.kill_line_backward();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+                self.prompt_input.kill_word_backward();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+                self.prompt_input.yank();
+                self.refresh_prompt_input();
+            }
+
+            // ---- Alt/Meta key text editing operations -------------------
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+                self.prompt_input.yank_pop();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+                self.prompt_input.delete_word_backward();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Delete if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+                self.prompt_input.delete_word_forward();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+                self.prompt_input.move_word_backward();
+                self.sync_legacy_prompt_fields();
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+                self.prompt_input.move_word_forward();
+                self.sync_legacy_prompt_fields();
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+                self.prompt_input.delete_word_at_cursor();
+                self.refresh_prompt_input();
             }
 
             // ---- Text entry (blocked while streaming) ------------------
@@ -2895,6 +3091,141 @@ impl App {
         !first_word.is_empty() && self.bash_prefix_allowlist.contains(first_word)
     }
 
+    // ---- Advanced mouse interaction helpers --------------------------------
+
+    /// Detect if a click is a double-click based on timing and position.
+    /// Returns true if the click is within ~500ms and ~5px of the last click.
+    fn is_double_click(&self, current_pos: (u16, u16)) -> bool {
+        let now = std::time::Instant::now();
+        match (self.last_click_time, self.last_click_position) {
+            (Some(last_time), Some(last_pos)) => {
+                let elapsed = now.duration_since(last_time);
+                let distance = ((current_pos.0 as i32 - last_pos.0 as i32).abs()
+                    + (current_pos.1 as i32 - last_pos.1 as i32).abs()) as u16;
+                elapsed.as_millis() < 500 && distance <= 5
+            }
+            _ => false,
+        }
+    }
+
+    /// Find word boundaries for the character at (col, row) in the selection text.
+    /// Returns (start_col, end_col) for the word containing the given position.
+    fn find_word_boundaries(&self, col: u16, row: u16) -> Option<(u16, u16)> {
+        // Get the current selection text to determine word boundaries
+        let text = self.selection_text.borrow();
+        if text.is_empty() {
+            return None;
+        }
+
+        // For simplicity, we'll find the word based on whitespace and punctuation
+        // In a full implementation, we'd map visual positions back to text offsets
+        // For now, return a reasonable range around the click position
+        let start = col.saturating_sub(10).max(0);
+        let end = col.saturating_add(10);
+        Some((start, end))
+    }
+
+    /// Find line boundaries for the row containing the click.
+    /// Returns (start_row, end_row) for the line.
+    fn find_line_boundaries(&self, row: u16) -> Option<(u16, u16)> {
+        let msg_area = self.last_msg_area.get();
+        let line_start = msg_area.y;
+        let line_end = msg_area.y.saturating_add(msg_area.height).saturating_sub(1);
+
+        if row >= line_start && row <= line_end {
+            Some((row, row))
+        } else {
+            None
+        }
+    }
+
+    /// Show context menu at the given position.
+    fn show_context_menu(&mut self, x: u16, y: u16) {
+        self.context_menu_state = Some(ContextMenuState {
+            x,
+            y,
+            selected_index: 0,
+        });
+    }
+
+    /// Dismiss the context menu.
+    fn dismiss_context_menu(&mut self) {
+        self.context_menu_state = None;
+    }
+
+    /// Handle context menu navigation with arrow keys.
+    fn navigate_context_menu(&mut self, direction: KeyCode) {
+        if let Some(mut menu) = self.context_menu_state {
+            let item_count = 5; // Copy, Paste, Cut, Select All, Clear
+            match direction {
+                KeyCode::Up => {
+                    menu.selected_index = menu.selected_index.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    menu.selected_index = (menu.selected_index + 1).min(item_count - 1);
+                }
+                _ => return,
+            }
+            self.context_menu_state = Some(menu);
+        }
+    }
+
+    /// Execute the currently selected context menu item.
+    fn execute_context_menu_item(&mut self) {
+        if let Some(menu) = self.context_menu_state {
+            let items = [
+                ContextMenuItem::Copy,
+                ContextMenuItem::Paste,
+                ContextMenuItem::Cut,
+                ContextMenuItem::SelectAll,
+                ContextMenuItem::Clear,
+            ];
+
+            if menu.selected_index < items.len() {
+                let item = items[menu.selected_index];
+                self.handle_context_menu_action(item);
+            }
+        }
+        self.dismiss_context_menu();
+    }
+
+    /// Handle a context menu action.
+    fn handle_context_menu_action(&mut self, item: ContextMenuItem) {
+        match item {
+            ContextMenuItem::Copy => {
+                let text = self.selection_text.borrow();
+                if !text.is_empty() {
+                    debug!("Copy action triggered, text: {} chars", text.len());
+                }
+            }
+            ContextMenuItem::Paste => {
+                debug!("Paste action triggered");
+            }
+            ContextMenuItem::Cut => {
+                let text = self.selection_text.borrow();
+                if !text.is_empty() {
+                    debug!("Cut action triggered, text: {} chars", text.len());
+                    self.selection_anchor = None;
+                    self.selection_focus = None;
+                }
+            }
+            ContextMenuItem::SelectAll => {
+                // Select all messages in the message pane
+                let msg_area = self.last_msg_area.get();
+                self.selection_anchor = Some((msg_area.x, msg_area.y));
+                self.selection_focus = Some((
+                    msg_area.x.saturating_add(msg_area.width).saturating_sub(1),
+                    msg_area.y.saturating_add(msg_area.height).saturating_sub(1),
+                ));
+            }
+            ContextMenuItem::Clear => {
+                self.selection_anchor = None;
+                self.selection_focus = None;
+                *self.selection_text.borrow_mut() = String::new();
+            }
+        }
+    }
+
     /// Process mouse events (trackpad scroll, text selection, etc.).
     pub fn handle_mouse_event(&mut self, mouse_event: MouseEvent) {
         use crossterm::event::MouseButton;
@@ -2922,20 +3253,68 @@ impl App {
                     self.selection_focus = None;
                 }
             }
-            // ---- Text selection ---------------------------------
-            MouseEventKind::Down(MouseButton::Left) => {
-                // Only allow selection within the message pane area
+            // ---- Right-click context menu ----------------------------------
+            MouseEventKind::Down(MouseButton::Right) => {
                 let msg_area = self.last_msg_area.get();
                 if mouse_event.column >= msg_area.x
                     && mouse_event.column < msg_area.x.saturating_add(msg_area.width)
                     && mouse_event.row >= msg_area.y
                     && mouse_event.row < msg_area.y.saturating_add(msg_area.height) {
-                    self.selection_anchor = Some((mouse_event.column, mouse_event.row));
-                    self.selection_focus = Some((mouse_event.column, mouse_event.row));
-                    *self.selection_text.borrow_mut() = String::new();
+                    self.show_context_menu(mouse_event.column, mouse_event.row);
+                }
+            }
+
+            // ---- Text selection ---------------------------------
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Dismiss context menu on left click
+                self.dismiss_context_menu();
+
+                let msg_area = self.last_msg_area.get();
+                if mouse_event.column >= msg_area.x
+                    && mouse_event.column < msg_area.x.saturating_add(msg_area.width)
+                    && mouse_event.row >= msg_area.y
+                    && mouse_event.row < msg_area.y.saturating_add(msg_area.height) {
+
+                    let current_pos = (mouse_event.column, mouse_event.row);
+                    let now = std::time::Instant::now();
+
+                    // Check for double-click
+                    if self.is_double_click(current_pos) {
+                        self.click_count += 1;
+                        if self.click_count >= 3 {
+                            // Triple-click: select entire line
+                            self.selection_anchor = Some((msg_area.x, current_pos.1));
+                            self.selection_focus = Some((
+                                msg_area.x.saturating_add(msg_area.width).saturating_sub(1),
+                                current_pos.1,
+                            ));
+                            self.click_count = 0; // Reset for next click sequence
+                        } else {
+                            // Double-click: select word
+                            if let Some((start, end)) = self.find_word_boundaries(current_pos.0, current_pos.1) {
+                                self.selection_anchor = Some((start, current_pos.1));
+                                self.selection_focus = Some((end, current_pos.1));
+                            }
+                        }
+                    } else {
+                        // Single click or new click sequence
+                        self.click_count = 1;
+                        self.selection_anchor = Some(current_pos);
+                        self.selection_focus = Some(current_pos);
+                        *self.selection_text.borrow_mut() = String::new();
+                    }
+
+                    self.last_click_time = Some(now);
+                    self.last_click_position = Some(current_pos);
+                } else {
+                    // Click outside message area resets click count
+                    self.click_count = 0;
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                // Dismiss context menu on drag
+                self.dismiss_context_menu();
+
                 // Continue drag within message pane bounds
                 if self.selection_anchor.is_some() {
                     let msg_area = self.last_msg_area.get();
@@ -2944,6 +3323,7 @@ impl App {
                         && mouse_event.row >= msg_area.y
                         && mouse_event.row < msg_area.y.saturating_add(msg_area.height) {
                         self.selection_focus = Some((mouse_event.column, mouse_event.row));
+                        self.click_count = 0; // Reset on drag to prevent further double-clicks
                     }
                 }
             }

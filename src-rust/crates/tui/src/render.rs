@@ -5,11 +5,12 @@ use std::cell::RefCell;
 use crate::agents_view::render_agents_menu;
 use crate::context_viz::render_context_viz;
 use crate::export_dialog::render_export_dialog;
-use crate::app::{App, SystemAnnotation, SystemMessageStyle, ToolStatus};
+use crate::app::{App, SystemAnnotation, SystemMessageStyle, ToolStatus, ContextMenuState, ContextMenuItem};
 use crate::clawd::{clawd_lines, ClawdPose};
 use crate::diff_viewer::render_diff_dialog;
 use crate::model_picker::render_model_picker;
 use crate::session_browser::render_session_browser;
+use crate::session_branching::render_session_branching;
 use crate::tasks_overlay::render_tasks_overlay;
 use crate::dialogs::{render_mcp_approval_dialog, render_permission_dialog};
 use crate::feedback_survey::render_feedback_survey;
@@ -524,6 +525,11 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_session_browser(&app.session_browser, size, frame.buffer_mut());
     }
 
+    // Session branching overlay
+    if app.session_branching.visible {
+        render_session_branching(&app.session_branching, size, frame.buffer_mut());
+    }
+
     // Export format picker dialog
     if app.export_dialog.visible {
         render_export_dialog(frame, &app.export_dialog, size);
@@ -564,6 +570,8 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         || app.global_search.open;
     if !modal_active {
         apply_selection_highlight(frame, app);
+        // Render context menu on top of selection
+        render_context_menu(frame, app);
     }
 }
 
@@ -625,6 +633,88 @@ fn apply_selection_highlight(frame: &mut Frame, app: &App) {
     }
     while text.ends_with(|c: char| c.is_whitespace()) { text.pop(); }
     *app.selection_text.borrow_mut() = text;
+}
+
+/// Render a right-click context menu at the specified position.
+fn render_context_menu(frame: &mut Frame, app: &App) {
+    if let Some(menu) = app.context_menu_state {
+        let items = [
+            ("Copy", !app.selection_text.borrow().is_empty()),
+            ("Paste", true),
+            ("Cut", !app.selection_text.borrow().is_empty()),
+            ("Select All", true),
+            ("Clear", app.selection_anchor.is_some()),
+        ];
+
+        let menu_height = (items.len() as u16).min(10); // Limit to 10 items max
+        let menu_width = 15; // Fixed width for context menu
+
+        // Clamp menu position to screen bounds
+        let screen = frame.size();
+        let menu_x = menu.x.min(screen.width.saturating_sub(menu_width + 1));
+        let menu_y = menu.y.min(screen.height.saturating_sub(menu_height + 1));
+
+        let menu_area = Rect {
+            x: menu_x,
+            y: menu_y,
+            width: menu_width,
+            height: menu_height,
+        };
+
+        // Draw menu background with border
+        let menu_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().fg(Color::White).bg(Color::DarkGray));
+        menu_block.render(menu_area, frame.buffer_mut());
+
+        // Render menu items
+        let inner = Rect {
+            x: menu_area.x + 1,
+            y: menu_area.y + 1,
+            width: menu_area.width.saturating_sub(2),
+            height: menu_area.height.saturating_sub(2),
+        };
+
+        for (idx, (label, enabled)) in items.iter().enumerate() {
+            if idx >= inner.height as usize {
+                break;
+            }
+
+            let y = inner.y + idx as u16;
+            let is_selected = idx == menu.selected_index;
+
+            let fg_color = if *enabled {
+                if is_selected { Color::Black } else { Color::White }
+            } else {
+                Color::Gray // Disabled items appear grayed
+            };
+
+            let bg_color = if is_selected {
+                if *enabled { Color::Cyan } else { Color::DarkGray }
+            } else {
+                Color::DarkGray
+            };
+
+            let style = Style::default().fg(fg_color).bg(bg_color);
+            let padded_label = format!(" {:<12} ", label);
+
+            if let Some(cell) = frame.buffer_mut().cell_mut((inner.x, y)) {
+                cell.set_symbol(&padded_label[0..1.min(padded_label.len())]);
+                cell.set_style(style);
+            }
+
+            for (col_offset, ch) in padded_label.chars().enumerate() {
+                if col_offset >= inner.width as usize {
+                    break;
+                }
+                if let Some(cell) = frame.buffer_mut().cell_mut((inner.x + col_offset as u16, y)) {
+                    cell.set_symbol(ch.to_string());
+                    cell.set_style(style);
+                }
+            }
+        }
+    }
 }
 
 // -----------------------------------------------------------------------

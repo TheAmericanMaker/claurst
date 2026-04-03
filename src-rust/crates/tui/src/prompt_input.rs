@@ -109,6 +109,10 @@ pub enum VimOperator {
     Delete,
     Change,
     Yank,
+    /// Uppercase region (gU).
+    Uppercase,
+    /// Lowercase region (gu).
+    Lowercase,
 }
 
 /// Vim character-find direction and variant.
@@ -339,7 +343,21 @@ fn motion_find_char(
     }
 }
 
-/// Apply an operator (d/c/y) to the range [from, to) in text.
+/// Convert text region to uppercase.
+fn uppercase_region(text: &str) -> String {
+    text.chars().map(|c| {
+        c.to_uppercase().next().unwrap_or(c)
+    }).collect()
+}
+
+/// Convert text region to lowercase.
+fn lowercase_region(text: &str) -> String {
+    text.chars().map(|c| {
+        c.to_lowercase().next().unwrap_or(c)
+    }).collect()
+}
+
+/// Apply an operator (d/c/y/gU/gu) to the range [from, to) in text.
 /// Returns `(new_text, new_cursor)`. For Change, sets mode to Insert.
 fn apply_operator_range(
     op: VimOperator,
@@ -351,7 +369,8 @@ fn apply_operator_range(
 ) -> (String, usize) {
     let to = to.min(text.len());
     let from = from.min(to);
-    *yank_buf = text[from..to].to_string();
+    let selected = &text[from..to];
+    *yank_buf = selected.to_string();
     match op {
         VimOperator::Yank => (text.to_string(), from),
         VimOperator::Delete => {
@@ -362,6 +381,16 @@ fn apply_operator_range(
         VimOperator::Change => {
             let new_text = format!("{}{}", &text[..from], &text[to..]);
             *mode = VimMode::Insert;
+            (new_text, from)
+        }
+        VimOperator::Uppercase => {
+            let upper = uppercase_region(selected);
+            let new_text = format!("{}{}{}", &text[..from], upper, &text[to..]);
+            (new_text, from)
+        }
+        VimOperator::Lowercase => {
+            let lower = lowercase_region(selected);
+            let new_text = format!("{}{}{}", &text[..from], lower, &text[to..]);
             (new_text, from)
         }
     }
@@ -788,6 +817,16 @@ fn vim_g(
             }
             false
         }
+        "U" => {
+            // `gU` — start case conversion uppercase operator
+            *pending = VimPendingState::Operator { op: VimOperator::Uppercase, count };
+            false
+        }
+        "u" => {
+            // `gu` — start case conversion lowercase operator
+            *pending = VimPendingState::Operator { op: VimOperator::Lowercase, count };
+            false
+        }
         _ => { *pending = VimPendingState::None; false }
     }
 }
@@ -804,8 +843,14 @@ fn vim_operator(
     op: VimOperator,
     count: usize,
 ) -> bool {
-    let op_char = match op { VimOperator::Delete => "d", VimOperator::Change => "c", VimOperator::Yank => "y" };
-    // Doubled operator = line op (dd, cc, yy)
+    let op_char = match op {
+        VimOperator::Delete => "d",
+        VimOperator::Change => "c",
+        VimOperator::Yank => "y",
+        VimOperator::Uppercase => "U",
+        VimOperator::Lowercase => "u",
+    };
+    // Doubled operator = line op (dd, cc, yy, gUU, guu)
     if key == op_char {
         let ls = text[..*cursor].rfind('\n').map(|p| p + 1).unwrap_or(0);
         let mut le = *cursor;
@@ -816,11 +861,22 @@ fn vim_operator(
             }
         }
         let le = le.min(text.len());
-        *yank_buf = text[ls..le].to_string();
+        let selected = &text[ls..le];
+        *yank_buf = selected.to_string();
         if op != VimOperator::Yank {
+            let new_content = match op {
+                VimOperator::Delete => String::new(),
+                VimOperator::Change => {
+                    *mode = VimMode::Insert;
+                    String::new()
+                }
+                VimOperator::Uppercase => uppercase_region(selected),
+                VimOperator::Lowercase => lowercase_region(selected),
+                VimOperator::Yank => unreachable!(),
+            };
             text.drain(ls..le);
-            *cursor = ls.min(text.len());
-            if op == VimOperator::Change { *mode = VimMode::Insert; }
+            text.insert_str(ls, &new_content);
+            *cursor = ls;
             return true;
         }
         return false;
@@ -1048,6 +1104,103 @@ pub fn handle_paste(
         format!("[Pasted text #{}]", paste_counter)
     };
     (placeholder, Some(content.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Kill ring (Emacs-style kill/yank system)
+// ---------------------------------------------------------------------------
+
+/// Kill ring stores accumulated kills (deleted text) for cycling through with Alt+Y.
+/// Maintains a FIFO list of kills with a current index for cycling backward.
+#[derive(Debug, Clone)]
+pub struct KillRing {
+    /// List of killed text entries. Most recent is last.
+    pub entries: Vec<String>,
+    /// Maximum number of entries to keep (prevents unbounded growth).
+    max_size: usize,
+    /// Current position in kill ring when cycling with Alt+Y (None = most recent).
+    pub current_index: Option<usize>,
+    /// Tracks whether the last action was a kill (for combining consecutive kills).
+    pub last_was_kill: bool,
+}
+
+impl KillRing {
+    /// Create a new kill ring with default capacity.
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::with_capacity(32),
+            max_size: 64,
+            current_index: None,
+            last_was_kill: false,
+        }
+    }
+
+    /// Add a kill entry. If the last operation was a kill, append to the most recent entry
+    /// instead of creating a new one (for combining consecutive kills).
+    pub fn push(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+
+        if self.last_was_kill && !self.entries.is_empty() {
+            // Append to the most recent entry (last_was_kill combines consecutive kills)
+            self.entries.last_mut().unwrap().push_str(&text);
+        } else {
+            // New kill entry
+            self.entries.push(text);
+            if self.entries.len() > self.max_size {
+                self.entries.remove(0);
+            }
+        }
+        self.current_index = None; // Reset cycling to most recent
+        self.last_was_kill = true;
+    }
+
+    /// Get the current kill to paste (most recent or current index if cycling).
+    pub fn get_current(&self) -> Option<&str> {
+        if self.entries.is_empty() {
+            return None;
+        }
+
+        match self.current_index {
+            None => self.entries.last().map(|s| s.as_str()),
+            Some(idx) => self.entries.get(idx).map(|s| s.as_str()),
+        }
+    }
+
+    /// Cycle backward through kill ring (Alt+Y after paste).
+    pub fn cycle_backward(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+
+        match self.current_index {
+            None => {
+                // Start cycling from the second-to-last entry
+                if self.entries.len() > 1 {
+                    self.current_index = Some(self.entries.len() - 2);
+                }
+            }
+            Some(0) => {
+                // Wrap around to the end
+                self.current_index = Some(self.entries.len() - 1);
+            }
+            Some(idx) => {
+                self.current_index = Some(idx - 1);
+            }
+        }
+    }
+
+    /// Mark that a non-kill action occurred (resets consecutive kill combination).
+    pub fn mark_non_kill(&mut self) {
+        self.last_was_kill = false;
+    }
+}
+
+impl Default for KillRing {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ---------------------------------------------------------------------------

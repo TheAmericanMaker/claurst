@@ -715,6 +715,7 @@ dependencies = [
  "futures",
  "hound",
  "icy_sixel",
+ "image",
  "once_cell",
  "parking_lot",
  "ratatui",

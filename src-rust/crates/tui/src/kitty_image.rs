@@ -265,21 +265,55 @@ fn decode_image_data(data: &[u8]) -> Result<ImageData, Box<dyn std::error::Error
 }
 
 /// Decode PNG image data into RGBA pixels.
-/// Returns an error if PNG decoding fails (no pure-Rust PNG decoder available by default).
-fn decode_png(_data: &[u8]) -> Result<ImageData, Box<dyn std::error::Error>> {
-    // PNG decoding requires an external library like `png` or `image`.
-    // For this implementation, we return an error and fall back to JPEG.
-    // In production, integrate a PNG decoder.
-    Err("PNG decoding not implemented; requires external crate".into())
+///
+/// Uses the `image` crate to decode PNG data and convert to RGBA8 format.
+/// Returns an error if decoding fails.
+fn decode_png(data: &[u8]) -> Result<ImageData, Box<dyn std::error::Error>> {
+    use image::ImageReader;
+    use std::io::Cursor;
+
+    // Decode the PNG using the image crate
+    let reader = ImageReader::new(Cursor::new(data))
+        .map_err(|e| format!("Failed to identify PNG: {}", e))?;
+    let image = reader.decode()
+        .map_err(|e| format!("Failed to decode PNG: {}", e))?;
+
+    // Convert to RGBA8 format
+    let rgba_image = image.to_rgba8();
+    let (width, height) = rgba_image.dimensions();
+    let pixels = rgba_image.into_raw();
+
+    Ok(ImageData {
+        pixels,
+        width,
+        height,
+    })
 }
 
 /// Decode JPEG image data into RGBA pixels.
-/// Returns an error if JPEG decoding fails (no pure-Rust JPEG decoder available by default).
-fn decode_jpeg(_data: &[u8]) -> Result<ImageData, Box<dyn std::error::Error>> {
-    // JPEG decoding requires an external library like `jpeg` or `image`.
-    // For this implementation, we return an error.
-    // In production, integrate a JPEG decoder.
-    Err("JPEG decoding not implemented; requires external crate".into())
+///
+/// Uses the `image` crate to decode JPEG data and convert to RGBA8 format.
+/// Returns an error if decoding fails.
+fn decode_jpeg(data: &[u8]) -> Result<ImageData, Box<dyn std::error::Error>> {
+    use image::ImageReader;
+    use std::io::Cursor;
+
+    // Decode the JPEG using the image crate
+    let reader = ImageReader::new(Cursor::new(data))
+        .map_err(|e| format!("Failed to identify JPEG: {}", e))?;
+    let image = reader.decode()
+        .map_err(|e| format!("Failed to decode JPEG: {}", e))?;
+
+    // Convert to RGBA8 format
+    let rgba_image = image.to_rgba8();
+    let (width, height) = rgba_image.dimensions();
+    let pixels = rgba_image.into_raw();
+
+    Ok(ImageData {
+        pixels,
+        width,
+        height,
+    })
 }
 
 /// Convert RGBA image data to Sixel format using the icy_sixel library.
@@ -324,4 +358,67 @@ fn emit_sixel_sequence(sixel_data: &[u8]) {
     // Move to a new line so subsequent output begins cleanly
     let _ = write!(stdout, "\r\n");
     let _ = stdout.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that we can decode a minimal valid PNG image.
+    /// This is a 1x1 transparent PNG (smallest possible valid PNG).
+    #[test]
+    fn test_decode_minimal_png() {
+        // Minimal 1x1 transparent PNG created with:
+        // echo -ne '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82' > test.png
+        let png_data = vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+
+        let result = decode_png(&png_data);
+        assert!(result.is_ok(), "PNG decoding should succeed");
+
+        let img = result.unwrap();
+        assert_eq!(img.width, 1, "PNG width should be 1");
+        assert_eq!(img.height, 1, "PNG height should be 1");
+        assert_eq!(img.pixels.len(), 4, "RGBA8 1x1 image should have 4 bytes");
+    }
+
+    /// Test that decode_image_data correctly identifies and decodes PNG by magic bytes.
+    #[test]
+    fn test_decode_image_data_detects_png() {
+        let png_data = vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+
+        let result = decode_image_data(&png_data);
+        assert!(result.is_ok(), "decode_image_data should detect and decode PNG");
+
+        let img = result.unwrap();
+        assert_eq!(img.width, 1);
+        assert_eq!(img.height, 1);
+    }
+
+    /// Test that invalid image data produces an error.
+    #[test]
+    fn test_decode_invalid_image() {
+        let invalid_data = vec![0x00, 0x00, 0x00, 0x00];
+        let result = decode_image_data(&invalid_data);
+        assert!(result.is_err(), "Invalid image data should produce an error");
+    }
+
+    /// Test that decode_image_data rejects empty data.
+    #[test]
+    fn test_decode_empty_data() {
+        let empty_data = vec![];
+        let result = decode_image_data(&empty_data);
+        assert!(result.is_err(), "Empty data should produce an error");
+    }
 }
